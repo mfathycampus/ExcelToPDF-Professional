@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-to-pdf-professional"
+version = "0.3.0"
+description = "Desktop app that converts Excel workbooks to verified, readable, printable PDF"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+dependencies = [
+    "PySide6-Essentials>=6.8",
+    "PyMuPDF>=1.24",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+]
+
+[project.optional-dependencies]
+excel = ["pywin32>=306; sys_platform == 'win32'"]
+dev = ["pytest>=8", "xlwt>=1.3", "ruff>=0.6"]
+
+[project.scripts]
+x2p = "x2p.cli:main"
+
+[project.gui-scripts]
+x2p-gui = "x2p.gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+x2p = ["resources/*.png", "engines/*_worker.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "engine: needs a real conversion engine (LibreOffice or Excel)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"

@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+tests/fixtures/generated/
+*.pdf
+build/
+
+# local tooling and release artifacts
+.claude/
+release/

@@ -7,8 +7,10 @@ violates a hard rule the pipeline asks `alternative_plan` for exactly one retry.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import replace
 
+from .metrics import CELL_PAD_PT, pt_to_col_chars, text_width_pt, wrapped_lines
 from .models import JobOptions, LayoutMode, SheetInfo, SheetPlan
 
 MM = 72 / 25.4
@@ -81,14 +83,159 @@ def _evaluate(si: SheetInfo, paper: str, orient: str, min_scale: float,
             "down": down, "pages": across * down}
 
 
+# Column widening (working copy). Exports from other systems often leave every column at the
+# default width, so text is wrapped into tall narrow columns or pushed to the appendix and dates
+# show ###. Numbers/dates always get the width they need (### is data loss). Text columns may
+# grow up to a cap; the planner tries several caps and keeps the one with the fewest pages.
+WIDTH_CAPS_PT = (0.0, 100.0, 140.0, 190.0, 250.0, 330.0, 450.0, 600.0)
+APPENDIX_CHARS_PER_PAGE = 2600
+TEXT_SLACK = 1.08   # engines differ in glyph widths (LibreOffice substitutes fonts): leave room
+
+
+def column_widths_for(si: SheetInfo, cap_pt: float) -> dict[int, float]:
+    """New widths (points) per column; only columns that grow are listed."""
+    current = dict(zip(si.visible_cols, si.col_widths_pt))
+    new: dict[int, float] = {}
+    for c, need in si.value_need_pt.items():
+        if c in current and need > current[c] + 0.5:
+            new[c] = math.ceil(need)
+    if cap_pt > 0:
+        header = si.header_row_guess if si.header_confidence >= 0.6 else None
+        need_text: dict[int, float] = {}
+        for r, c, em, fsz, token in si.text_cells:
+            if c not in current:
+                continue
+            # header: its longest word must fit (the header itself may wrap)
+            w = text_width_pt(token if r == header else em, fsz) * TEXT_SLACK + CELL_PAD_PT
+            if w > need_text.get(c, 0.0):
+                need_text[c] = w
+        for c, w in need_text.items():
+            base = max(current[c], new.get(c, 0.0))
+            if w > base + 0.5:
+                new[c] = float(math.ceil(max(base, min(w, cap_pt))))
+    return new
+
+
+def with_widths(si: SheetInfo, widths: dict[int, float]) -> SheetInfo:
+    """A copy of the sheet description as if the columns had these widths."""
+    if not widths:
+        return si
+    s2 = replace(si)
+    width_of = dict(zip(si.visible_cols, si.col_widths_pt))
+    width_of.update(widths)
+    s2.col_widths_pt = [width_of[c] for c in si.visible_cols]
+    s2.overflow = []
+    for r, c, em, fsz, token in si.text_cells:
+        lines = wrapped_lines(em, token, fsz, width_of.get(c, 1.0))
+        if lines > 1:
+            s2.overflow.append((r, c, round(lines, 1)))
+    s2.overflow_cells = len(s2.overflow)
+    s2.widened_cols = dict(widths)
+    return s2
+
+
+def _appendix_pages(si: SheetInfo, plan: SheetPlan) -> float:
+    if not plan.long_cells:
+        return 0.0
+    chars = sum(len(str(si.long_texts.get(k, ""))) for k in plan.long_cells)
+    return chars / APPENDIX_CHARS_PER_PAGE + len(plan.long_cells) * 0.04
+
+
 def plan_sheet(si: SheetInfo, opts: JobOptions) -> SheetPlan:
+    mode = opts.per_sheet_mode.get(si.name, opts.mode)
+    manual = opts.manual.get(si.name) or {}
+    widen = opts.widen_columns and manual.get("widen_columns") is not False
+    if not widen or not si.visible_cols:
+        caps = (None,)                      # original widths exactly
+    elif mode in (LayoutMode.AUTO, LayoutMode.MANUAL):
+        caps = WIDTH_CAPS_PT
+    else:
+        caps = (0.0,)                       # fit modes: only numbers/dates grow (no ###)
+    best = None
+    for cap in caps:
+        s2 = si if cap is None else with_widths(si, column_widths_for(si, cap))
+        plan = _plan_with_wrapping(s2, opts)
+        if plan.mode == LayoutMode.CARDS or plan.keep_original:
+            return plan
+        score = (math.ceil(plan.expected_pages + _appendix_pages(s2, plan)), len(plan.long_cells),
+                 plan.expected_pages_across, plan.wrapped_cells)
+        if best is None or score < best[0]:
+            best = (score, plan, s2)
+    _score, plan, s2 = best
+    rect = si.layout_rect or si.content
+    if (not si.has_borders and si.kind == "worksheet" and rect is not None
+            and len(si.col_widths_pt) >= 2 and len(si.row_heights_pt) >= 3 and opts.gridlines):
+        plan.print_gridlines = True
+        plan.notes.append("gridlines_added")
+    if s2.widened_cols:
+        _wrap_text_columns(s2, plan)
+        for c, pt in sorted(s2.widened_cols.items()):
+            letter = col_letter(c)
+            plan.col_widths[letter] = pt_to_col_chars(pt, si.wb_font_pt)
+            plan.col_widths_pt[letter] = pt
+        plan.notes.insert(0, "columns_widened")
+    if plan.expected_pages_across >= CARDS_SUGGEST_ACROSS and plan.mode == LayoutMode.AUTO:
+        plan.notes.append("cards_suggested")
+    if manual:
+        _apply_manual_extras(si, plan, manual)
+    _apply_template(si, plan, opts)
+    return plan
+
+
+def _apply_manual_extras(si: SheetInfo, plan: SheetPlan, manual: dict) -> None:
+    """Gridlines on/off and a page break every N visible data rows (header row repeats)."""
+    if "print_gridlines" in manual:
+        plan.print_gridlines = bool(manual["print_gridlines"])
+        if not plan.print_gridlines and "gridlines_added" in plan.notes:
+            plan.notes.remove("gridlines_added")
+    n = int(manual.get("break_every") or 0)
+    rect = si.layout_rect or si.content
+    if n > 0 and rect is not None:
+        header = si.header_row_guess if si.header_confidence >= 0.6 else None
+        first = (header + 1) if header else rect.min_row
+        hidden = set(si.hidden_row_numbers)
+        visible = [r for r in range(first, rect.max_row + 1) if r not in hidden]
+        plan.row_breaks = visible[n::n][:1000]          # Excel allows 1026 manual breaks per sheet
+        if plan.row_breaks:
+            plan.fit_height = 0 if plan.fit_width else plan.fit_height
+            plan.notes.append("manual_page_breaks")
+
+
+def _wrap_text_columns(si: SheetInfo, plan: SheetPlan) -> None:
+    """Safety net once widths were changed from estimates: wrap every text column, so a text the
+    estimate under-measured goes to a second line instead of being clipped (wrapping is lossless;
+    rows get their optimal height)."""
+    cols = {}
+    for r, c, *_ in si.text_cells:
+        lo, hi = cols.get(c, (r, r))
+        cols[c] = (min(lo, r), max(hi, r))
+    for rng in plan.wrap_ranges:
+        m = re.fullmatch(r"([A-Z]+)(\d+):[A-Z]+(\d+)", rng)
+        if m:
+            c = col_index(m.group(1))
+            lo, hi = cols.get(c, (int(m.group(2)), int(m.group(3))))
+            cols[c] = (min(lo, int(m.group(2))), max(hi, int(m.group(3))))
+    if not cols:
+        return
+    plan.wrap_ranges = [f"{col_letter(c)}{lo}:{col_letter(c)}{hi}" for c, (lo, hi) in sorted(cols.items())]
+    lo = min(v[0] for v in cols.values())
+    hi = max(v[1] for v in cols.values())
+    plan.autofit_rows = visible_row_blocks(si, lo, hi)
+
+
+def col_index(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def _plan_with_wrapping(si: SheetInfo, opts: JobOptions) -> SheetPlan:
     plan = _plan_sheet(si, opts)
     if plan.mode == LayoutMode.CARDS:
         return plan
     if opts.wrap_overflow and si.overflow and not plan.keep_original:
         add_overflow_wrapping(si, plan, opts)
-    if plan.expected_pages_across >= CARDS_SUGGEST_ACROSS and plan.mode == LayoutMode.AUTO:
-        plan.notes.append("cards_suggested")
     return plan
 
 
@@ -146,14 +293,16 @@ def add_overflow_wrapping(si: SheetInfo, plan: SheetPlan, opts: JobOptions) -> N
     goes to the long-text appendix instead and the cell shows a reference marker.
     Applied to the working copy only; both are reported."""
     to_appendix = opts.long_text == "appendix"
+    header = si.header_row_guess if si.header_confidence >= 0.6 else None
     long_cells, cols = [], {}
     for r, c, lines in si.overflow:
-        if to_appendix and lines > opts.long_text_lines and (r, c) in si.long_texts:
+        if to_appendix and r != header and lines > opts.long_text_lines and (r, c) in si.long_texts:
             long_cells.append((r, c))
             continue
         lo, hi = cols.get(c, (r, r))
         cols[c] = (min(lo, r), max(hi, r))
     plan.long_cells = sorted(long_cells)
+    plan.wrapped_cells = len(si.overflow) - len(long_cells)
     if to_appendix and long_cells:
         # markers are short: no wrapping needed for those cells, rows can be autofit
         cols_long = {c for _, c in long_cells}
@@ -240,16 +389,8 @@ def _plan_sheet(si: SheetInfo, opts: JobOptions) -> SheetPlan:
             plan.notes.append("one_page_text_below_minimum")
         return _apply_manual(plan, opts)
 
-    title_rows = ps.title_rows
-    if not title_rows and si.header_row_guess and si.header_confidence >= 0.7:
-        title_rows = f"{si.header_row_guess}:{si.header_row_guess}"
-    key_cols = 0
-    title_cols = ps.title_cols
-    if title_cols:
-        key_cols = 1
-    elif si.key_col_guess and si.key_confidence >= 0.7:
-        key_cols = 1
-        title_cols = f"{col_letter(si.key_col_guess)}:{col_letter(si.key_col_guess)}"
+    title_rows, title_cols = suggested_titles(si, opts)
+    key_cols = _range_cols(title_cols)
 
     if mode == LayoutMode.FIT_WIDTH:
         best = max((_evaluate(si, p, o, 0.0, title_rows, 0) for p in papers
@@ -295,6 +436,50 @@ def _plan_sheet(si: SheetInfo, opts: JobOptions) -> SheetPlan:
     if best["down"] > 1 or best["across"] > 1:
         plan.title_rows = title_rows
     return _apply_manual(plan, opts)
+
+
+def suggested_titles(si: SheetInfo, opts: JobOptions | None = None) -> tuple[str | None, str | None]:
+    """Rows/columns repeated on every page. Precedence: the user's template, the file's print
+    titles, the file's frozen panes, then the detected header row / key column."""
+    tpl = (opts.templates.get(si.name) if opts else None) or {}
+    ps = si.page_setup
+    rows = ps.title_rows or si.frozen_rows
+    if not rows and si.header_row_guess and si.header_confidence >= 0.7:
+        rows = f"{si.header_row_guess}:{si.header_row_guess}"
+    cols = ps.title_cols or si.frozen_cols
+    if not cols and si.key_col_guess and si.key_confidence >= 0.7:
+        cols = f"{col_letter(si.key_col_guess)}:{col_letter(si.key_col_guess)}"
+    if "title_rows" in tpl:
+        rows = tpl["title_rows"] or None
+    if "title_cols" in tpl:
+        cols = tpl["title_cols"] or None
+    return rows, cols
+
+
+def _range_cols(cols: str | None) -> int:
+    if not cols:
+        return 0
+    a, _, b = cols.partition(":")
+    try:
+        return max(1, col_index(b or a) - col_index(a) + 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _apply_template(si: SheetInfo, plan: SheetPlan, opts: JobOptions) -> None:
+    """Page order and row numbers for split tables (defaults; the template may override)."""
+    tpl = opts.templates.get(si.name) or {}
+    if plan.mode in (LayoutMode.CARDS, LayoutMode.ONE_PAGE) or plan.keep_original:
+        return
+    if plan.expected_pages_across > 1:
+        plan.page_order = tpl.get("page_order") or "over"
+        if not plan.title_cols and tpl.get("row_numbers", True):
+            plan.print_headings = True
+            if "no_key_column_detected" in plan.notes:
+                plan.notes.remove("no_key_column_detected")
+            plan.notes.append("row_numbers_added")
+    elif tpl.get("page_order"):
+        plan.page_order = tpl["page_order"]
 
 
 def _apply_manual(plan: SheetPlan, opts: JobOptions) -> SheetPlan:

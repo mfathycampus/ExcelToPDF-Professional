@@ -109,6 +109,14 @@ class SheetInfo:
     header_texts: dict[int, str] = field(default_factory=dict)            # col -> header caption
     key_texts: dict[int, str] = field(default_factory=dict)               # row -> key column value
     hidden_row_numbers: list[int] = field(default_factory=list)
+    visible_cols: list[int] = field(default_factory=list)       # column numbers behind col_widths_pt
+    frozen_rows: str | None = None                               # "1:2" from the sheet's frozen panes
+    frozen_cols: str | None = None                               # "A:B"
+    has_borders: bool = False                                    # any cell border in the first rows
+    wb_font_pt: float = 11.0                                     # workbook default font (column width unit)
+    text_cells: list[tuple[int, int, int, float, int]] = field(default_factory=list)  # unwrapped text: r, c, width em, pt, longest word em
+    value_need_pt: dict[int, float] = field(default_factory=dict)  # col -> width numbers/dates need (no ###)
+    widened_cols: dict[int, float] = field(default_factory=dict)   # col -> new width pt (working copy)
     header_row_guess: int | None = None
     header_confidence: float = 0.0
     key_col_guess: int | None = None
@@ -143,7 +151,7 @@ class WorkbookInfo:
         d["issues"] = [i.to_dict() for i in self.issues]
         for s in d["sheets"]:  # keep reports small
             for k in ("col_widths_pt", "row_heights_pt", "hidden_row_numbers", "overflow", "long_texts",
-                      "header_texts", "key_texts"):
+                      "header_texts", "key_texts", "text_cells", "value_need_pt", "visible_cols", "widened_cols"):
                 s.pop(k, None)
         return d
 
@@ -167,6 +175,13 @@ class SheetPlan:
     autofit_rows: list[str] = field(default_factory=list)    # e.g. "2:50" -> optimal row height (visible rows only)
     long_cells: list[tuple[int, int]] = field(default_factory=list)  # cells whose text moves to the appendix
     endnotes: list[tuple[str, str]] = field(default_factory=list)    # (address, marker) set on the working copy
+    col_widths: dict[str, float] = field(default_factory=dict)       # column letter -> width (Excel characters), working copy
+    col_widths_pt: dict[str, float] = field(default_factory=dict)    # same widths in points (LibreOffice)
+    wrapped_cells: int = 0
+    print_gridlines: bool = False        # sheet has no borders: print gridlines so rows can be followed
+    row_breaks: list[int] = field(default_factory=list)  # manual page break before these rows
+    page_order: str = "down"             # "over": across then down (parts of the same rows are consecutive)
+    print_headings: bool = False         # print row numbers / column letters (no repeated key column)
     cards: dict | None = None            # card-per-record build instructions (LayoutMode.CARDS)
     expected_pages_across: int = 1
     expected_pages: int = 1
@@ -190,11 +205,14 @@ class JobOptions:
     allow_larger_paper: bool = False
     min_font_pt: float = 8.0
     engine: str = "auto"                 # auto | libreoffice | excel
-    timeout_s: int = 300
+    timeout_s: int = 300                 # base limit; +1 s per 50 cells (pipeline)
     max_file_mb: int = 200
     max_text_cells: int = 30000          # per sheet, for coverage verification
     allow_failed_output: bool = False    # deliver even if verification failed (explicit)
     wrap_overflow: bool = True           # wrap text that would be clipped (working copy only, reported)
+    templates: dict[str, dict] = field(default_factory=dict)  # sheet -> {title_rows, title_cols, page_order, row_numbers}
+    gridlines: bool = True               # print gridlines for borderless tables (auto/manual)
+    widen_columns: bool = True          # widen too-narrow columns on the working copy (auto/manual)
     long_text: str = "appendix"          # appendix | wrap : text too long to wrap legibly in its cell
     long_text_lines: int = 3             # wrapped-line estimate above which a cell goes to the appendix
     lang: str = "ar"                     # language of generated content (appendix captions)

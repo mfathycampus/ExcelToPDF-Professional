@@ -188,8 +188,9 @@ def test_overflow_planning_and_lossless_appendix(fixtures):
     si = inspect_workbook(fixtures["13_long_text_appendix"]).sheets[0]
     plan = plan_sheet(si, JobOptions())
     assert plan.long_cells and plan.wrap_ranges and "long_text_to_appendix" in plan.notes
-    # URL and JSON cannot wrap -> appendix even though they are not that long
-    assert (2, 3) in plan.long_cells and (2, 4) in plan.long_cells
+    # short URL/JSON: both engines break long words, so they stay in their (wider) cells
+    assert (2, 3) not in plan.long_cells and (2, 4) not in plan.long_cells
+    assert "columns_widened" in plan.notes and "C" in plan.col_widths
     built = build_appendix([(si, plan)], [si.name], "ar", "A4")
     assert built is not None
     a_plan, rows, bold, rtl = built
@@ -224,3 +225,90 @@ def test_card_mode_plan(fixtures):
     assert (c["header_row"], c["first_row"], c["key_col"]) == (1, 2, 1)
     assert (c["first_col"], c["last_col"], c["last_row"]) == (1, 40, 301)
     assert len(c["sheet_name"]) <= 31 and not plan.long_cells and not plan.wrap_ranges
+
+
+def test_column_widening_prevents_hash_and_appendix_for_short_text(tmp_path):
+    """System exports keep every column at the default width: dates must not show ###, short
+    texts must not go to the appendix, header words must fit, and the fewest pages win."""
+    import datetime as dt
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID", "Percentage", "Details", "End Date", "Logo"])
+    for i in range(60):
+        ws.append([i, 50, "تفاصيل العرض " * 4, dt.datetime(2026, 9, 27, 23, 59),
+                   f"https://cdn.example.com/storage/places/logos/{i:04d}_abcdefghijklmnop.png"])
+        ws.cell(ws.max_row, 4).number_format = "m/d/yyyy h:mm"
+    p = tmp_path / "dump.xlsx"
+    wb.save(p)
+    si = inspect_workbook(p).sheets[0]
+    assert all(w == si.col_widths_pt[0] for w in si.col_widths_pt) and not si.has_borders
+    plan = plan_sheet(si, JobOptions())
+    assert not plan.long_cells                         # nothing short goes to the appendix
+    assert "D" in plan.col_widths                      # the date column grows: no ###
+    assert plan.print_gridlines and "gridlines_added" in plan.notes
+    # the chosen widths are never worse (in pages) than keeping the original widths
+    plain = plan_sheet(si, JobOptions(widen_columns=False))
+    assert plan.expected_pages <= plain.expected_pages + max(1, len(plain.long_cells) // 30)
+    assert plan_sheet(si, JobOptions(mode=LayoutMode.KEEP_ORIGINAL)).col_widths == {}
+
+
+def test_manual_page_breaks_gridlines_and_widening(tmp_path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "data"
+    ws.append(["ID", "Name", "Notes"])
+    for i in range(1, 51):
+        ws.append([i, f"name {i}", "a fairly long note that does not fit the default column " * 2])
+    ws.row_dimensions[10].hidden = True
+    p = tmp_path / "m.xlsx"
+    wb.save(p)
+    si = inspect_workbook(p).sheets[0]
+    auto = plan_sheet(si, JobOptions())
+    assert auto.print_gridlines and auto.col_widths and not auto.row_breaks
+    manual = {"data": {"break_every": 20, "print_gridlines": False, "widen_columns": False}}
+    plan = plan_sheet(si, JobOptions(mode=LayoutMode.MANUAL, manual=manual))
+    assert not plan.print_gridlines and "gridlines_added" not in plan.notes
+    assert plan.col_widths == {}
+    # 20 visible data rows per page: 2-9 and 11-22 (row 10 is hidden) -> break before 23
+    assert plan.row_breaks == [23, 43] and "manual_page_breaks" in plan.notes
+
+
+def _wide_book(tmp_path, freeze=None, key=True):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "wide"
+    ws.append((["ID"] if key else []) + [f"Field {i}" for i in range(1, 31)])
+    for r in range(1, 41):
+        ws.append(([r] if key else []) + [f"value {r}-{i} text" for i in range(1, 31)])
+    if freeze:
+        ws.freeze_panes = freeze
+    p = tmp_path / f"w_{freeze}_{key}.xlsx"
+    wb.save(p)
+    return inspect_workbook(p).sheets[0]
+
+
+def test_frozen_panes_define_repeated_titles(tmp_path):
+    from x2p.layout import suggested_titles
+    si = _wide_book(tmp_path, freeze="C3")
+    assert (si.frozen_rows, si.frozen_cols) == ("1:2", "A:B")
+    assert suggested_titles(si, JobOptions()) == ("1:2", "A:B")
+    plan = plan_sheet(si, JobOptions())
+    assert plan.expected_pages_across > 1
+    assert plan.title_rows == "1:2" and plan.title_cols == "A:B"
+    assert plan.page_order == "over"                     # parts of the same rows come together
+    assert not plan.print_headings                        # a column repeats: no row numbers needed
+
+
+def test_template_overrides_and_row_numbers(tmp_path):
+    si = _wide_book(tmp_path, key=False)
+    plan = plan_sheet(si, JobOptions(templates={"wide": {"title_cols": "", "page_order": "down"}}))
+    assert plan.expected_pages_across > 1 and plan.title_cols is None
+    assert plan.page_order == "down"
+    assert plan.print_headings and "row_numbers_added" in plan.notes   # ties parts together
+    off = plan_sheet(si, JobOptions(templates={"wide": {"title_cols": "", "row_numbers": False}}))
+    assert not off.print_headings
+    keyed = plan_sheet(si, JobOptions(templates={"wide": {"title_cols": "A:A", "title_rows": "1:1"}}))
+    assert keyed.title_cols == "A:A" and keyed.title_rows == "1:1" and not keyed.print_headings

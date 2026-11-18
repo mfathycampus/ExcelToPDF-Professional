@@ -12,6 +12,83 @@ import traceback
 from pathlib import Path
 
 PAPER = {"Letter": 1, "Legal": 5, "A3": 8, "A4": 9, "A5": 11}
+PAPER_PT = {"Letter": (612, 792), "Legal": (612, 1008), "A3": (842, 1191), "A4": (595, 842), "A5": (420, 595)}
+
+
+def pdf_page_size(path):
+    try:
+        import pymupdf
+        with pymupdf.open(str(path)) as d:
+            if d.page_count:
+                r = d[0].rect
+                return r.width, r.height
+    except Exception:
+        pass
+    return None
+
+
+def paper_matches(size, paper):
+    want = PAPER_PT.get(paper or "")
+    if not size or not want:
+        return True
+    return abs(min(size) - want[0]) <= 3 and abs(max(size) - want[1]) <= 3
+
+
+def printer_candidates():
+    """Installed printers as Excel names them ("Name on Ne02:"); PDF printers first. Excel exports
+    through the active printer's driver, and some drivers (or an unreachable network printer)
+    ignore the requested paper size; the switch affects this private Excel instance only."""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows NT\CurrentVersion\Devices")
+    except OSError:
+        return []
+    out, i = [], 0
+    while True:
+        try:
+            name, value, _ = winreg.EnumValue(k, i)
+        except OSError:
+            break
+        i += 1
+        port = str(value).split(",")[-1]
+        if port and port.lower() != "nul:":
+            out.append("%s on %s" % (name, port))
+    out.sort(key=lambda n: (0 if n.startswith("Adobe PDF") else 1 if "PDF" in n else 2))
+    return out
+
+
+def export_sheet(xl, ws, plan, out, state):
+    """Export; if the PDF paper differs from the plan, retry through other printers once per job."""
+    ws.ExportAsFixedFormat(Type=0, Filename=str(out), Quality=0, IncludeDocProperties=True,
+                           IgnorePrintAreas=False, OpenAfterPublish=False)
+    paper = None if plan.get("keep_original") else plan.get("paper")
+    if not paper or paper_matches(pdf_page_size(out), paper) or state.get("no_better_printer"):
+        return None
+    original = xl.ActivePrinter
+    for name in printer_candidates():
+        if name in state.setdefault("tried", set()) or name == original:
+            continue
+        state["tried"].add(name)
+        try:
+            xl.ActivePrinter = name
+            apply_plan(xl, ws, plan)
+            ws.ExportAsFixedFormat(Type=0, Filename=str(out), Quality=0, IncludeDocProperties=True,
+                                   IgnorePrintAreas=False, OpenAfterPublish=False)
+        except Exception:
+            continue
+        if paper_matches(pdf_page_size(out), paper):
+            state["printer"] = name
+            return None
+    state["no_better_printer"] = True
+    try:
+        xl.ActivePrinter = original
+        apply_plan(xl, ws, plan)
+        ws.ExportAsFixedFormat(Type=0, Filename=str(out), Quality=0, IncludeDocProperties=True,
+                               IgnorePrintAreas=False, OpenAfterPublish=False)
+    except Exception:
+        pass
+    size = pdf_page_size(out)
+    return [round(size[0]), round(size[1])] if size else None
 XL_CONSTANTS, XL_FORMULAS, XL_VISIBLE = 2, -4123, 12
 MM_TO_PT = 72 / 25.4
 
@@ -19,6 +96,8 @@ MM_TO_PT = 72 / 25.4
 def apply_plan(xl, ws, plan):
     if plan.get("keep_original"):
         return
+    for letter, chars in (plan.get("col_widths") or {}).items():
+        ws.Columns(letter).ColumnWidth = min(255.0, float(chars))
     for addr, marker in plan.get("endnotes") or []:
         ws.Range(addr).Value = marker
     for rng in plan.get("wrap_ranges") or []:
@@ -47,6 +126,11 @@ def apply_plan(xl, ws, plan):
             ps.FitToPagesWide = int(plan["fit_width"]) if plan.get("fit_width") else False
             ps.FitToPagesTall = int(plan["fit_height"]) if plan.get("fit_height") else False
         ps.CenterHorizontally = bool(plan.get("center_horizontally"))
+        if plan.get("print_gridlines"):
+            ps.PrintGridlines = True
+        if plan.get("print_headings"):
+            ps.PrintHeadings = True
+        ps.Order = 2 if plan.get("page_order") == "over" else 1   # xlOverThenDown / xlDownThenOver
         if plan.get("title_rows"):
             a, b = plan["title_rows"].split(":")
             ps.PrintTitleRows = "$%s:$%s" % (a, b)
@@ -58,6 +142,11 @@ def apply_plan(xl, ws, plan):
             xl.PrintCommunication = True
         except Exception:
             pass
+    breaks = plan.get("row_breaks") or []
+    if breaks:
+        ws.ResetAllPageBreaks()
+        for r in breaks:
+            ws.HPageBreaks.Add(Before=ws.Rows(int(r)))
 
 
 def split_chunks(text, size):
@@ -251,6 +340,7 @@ def main(job_path, result_path):
         wb = xl.Workbooks.Open(str(Path(job["input"]).resolve()), UpdateLinks=0, ReadOnly=False,
                                IgnoreReadOnlyRecommended=True, Notify=False, AddToMru=False)
         out_dir = Path(job["out_dir"])
+        printer_state = {}
         for i, spec in enumerate(job["sheets"]):
             r = {"name": spec["name"], "pdf": None, "error": None, "texts": [], "sampled": False,
                  "hash_cells": []}
@@ -266,9 +356,7 @@ def main(job_path, result_path):
                 apply_plan(xl, ws, spec["plan"])
                 out = out_dir / ("sheet_%03d.pdf" % i)
                 try:
-                    ws.ExportAsFixedFormat(Type=0, Filename=str(out), Quality=0,
-                                           IncludeDocProperties=True, IgnorePrintAreas=False,
-                                           OpenAfterPublish=False)
+                    r["paper_mismatch"] = export_sheet(xl, ws, spec["plan"] or {}, out, printer_state)
                 except Exception as exc:
                     sys.stderr.write("export %d: %s\n" % (i, exc))
                     r["error"] = "nothing_to_print"

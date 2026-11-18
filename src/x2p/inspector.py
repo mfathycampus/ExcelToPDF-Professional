@@ -14,6 +14,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .formats import FileCheck, UnsafeFileError, check_file
+from .metrics import display_chars, number_width_pt, text_em, wrapped_lines
 from .models import CellRect, Issue, PageSetupInfo, Severity, SheetInfo, WorkbookInfo
 
 PAPER_CODES = {1: "Letter", 5: "Legal", 8: "A3", 9: "A4", 11: "A5"}
@@ -30,9 +31,7 @@ _ANCHORS = ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor")
 GRID_ROWS = 60  # rows sampled for header/key heuristics
 # Average glyph advance as a fraction of the font size. Deliberately generous: wrapping a
 # cell that would have fitted is harmless, missing one that overflows loses data.
-CHAR_WIDTH_EM = 0.55
-LONG_TEXT_KEEP_LINES = 2  # keep the text of cells above this estimate (appendix candidates)
-UNBREAKABLE = 999.0       # wrapped-line estimate used for text that cannot wrap
+LONG_TEXT_KEEP_LINES = 1  # keep the text of every overflowing cell (appendix candidates)
 
 
 def inspect_workbook(path: str | Path, *, max_mb: int = 200) -> WorkbookInfo:
@@ -64,6 +63,27 @@ def col_width_to_pt(width_chars: float, base_font_pt: float = 11.0) -> float:
     mdw = 7.0 * base_font_pt / 11.0          # max digit width in px at 96 dpi
     px = int(width_chars * mdw + 5) if width_chars > 0 else 0
     return px * 0.75
+
+
+def _frozen_titles(ws) -> tuple[str | None, str | None]:
+    """Frozen panes are the author's statement of which rows/columns must stay visible."""
+    from openpyxl.utils.cell import coordinate_from_string, get_column_letter
+    fp = ws.freeze_panes
+    if not fp:
+        return None, None
+    try:
+        col, row = coordinate_from_string(fp)
+    except ValueError:
+        return None, None
+    from openpyxl.utils.cell import column_index_from_string
+    c = column_index_from_string(col)
+    rows = f"1:{row - 1}" if row > 1 else None
+    cols = f"A:{get_column_letter(c - 1)}" if c > 1 else None
+    if rows and row - 1 > 10:
+        rows = None          # a pane frozen low on the sheet is a view choice, not a header
+    if cols and c - 1 > 5:
+        cols = None
+    return rows, cols
 
 
 def _strip_abs(ref: str | None) -> str | None:
@@ -195,6 +215,7 @@ def _inspect_ooxml(fc: FileCheck) -> WorkbookInfo:
         rect: CellRect | None = None
         sizes: Counter = Counter()
         text_cells: list[tuple[int, int, int, float, int]] = []  # r, c, chars, font pt, longest token
+        value_cells: list[tuple[int, int, int, float]] = []      # r, c, displayed chars, font pt
         for (r, c), cell in ws._cells.items():  # noqa: SLF001 - fastest way to skip empty cells
             v = cell.value
             if v is None or v == "":
@@ -205,9 +226,10 @@ def _inspect_ooxml(fc: FileCheck) -> WorkbookInfo:
             if isinstance(v, str) and cell.data_type != "f":
                 al = cell.alignment
                 if al is None or not (al.wrap_text or al.shrink_to_fit):
-                    longest = len(v)  # wrap is off: line breaks do not start new lines
-                    token = max((len(t) for t in v.split()), default=0)
-                    text_cells.append((r, c, longest, fsz, token))
+                    # wrap is off: line breaks do not start new lines, the whole text is one line
+                    text_cells.append((r, c, text_em(v), fsz, max((text_em(t) for t in v.split()), default=0.0)))
+            elif cell.data_type != "f" and not isinstance(v, str):
+                value_cells.append((r, c, display_chars(v, cell.number_format), fsz))
             if cell.data_type == "f":
                 si.formula_cells += 1
             else:
@@ -216,6 +238,10 @@ def _inspect_ooxml(fc: FileCheck) -> WorkbookInfo:
                 si.comments += 1
             if r <= GRID_ROWS:
                 grid[(r, c)] = v
+                b = cell.border
+                if b is not None and not si.has_borders and any(
+                        getattr(getattr(b, side, None), "style", None) for side in ("left", "right", "top", "bottom")):
+                    si.has_borders = True
                 if cell.font is not None and cell.font.b:
                     bold_rows.add(r)
             rect = CellRect(r, c, r, c).union(rect)
@@ -231,6 +257,7 @@ def _inspect_ooxml(fc: FileCheck) -> WorkbookInfo:
         si.tables = len(ws.tables)
         si.conditional_formats = len(ws.conditional_formatting)
         si.right_to_left = bool(ws.sheet_view.rightToLeft)
+        si.frozen_rows, si.frozen_cols = _frozen_titles(ws)
 
         # dimensions
         fmt = ws.sheet_format
@@ -300,16 +327,22 @@ def _inspect_ooxml(fc: FileCheck) -> WorkbookInfo:
                 if (mr.max_row - mr.min_row + 1) * (mr.max_col - mr.min_col + 1) <= 100_000:
                     merged.update((rr, cc) for rr in range(mr.min_row, mr.max_row + 1)
                                   for cc in range(mr.min_col, mr.max_col + 1))
+            si.wb_font_pt = base_font
+            si.visible_cols = [c for c in range(lrect.min_col, lrect.max_col + 1) if c not in col_hidden]
+
+            def inside(r, c):
+                return ((r, c) not in merged and r not in hidden_rows and c not in col_hidden
+                        and lrect.min_row <= r <= lrect.max_row and lrect.min_col <= c <= lrect.max_col)
+
+            for r, c, chars, fsz in value_cells:
+                if inside(r, c):
+                    need = number_width_pt(chars, fsz)
+                    si.value_need_pt[c] = max(si.value_need_pt.get(c, 0.0), need)
             for r, c, chars, fsz, token in text_cells:
-                if (r, c) in merged or r in hidden_rows or c in col_hidden:
+                if not inside(r, c):
                     continue
-                if not (lrect.min_row <= r <= lrect.max_row and lrect.min_col <= c <= lrect.max_col):
-                    continue
-                width = col_width_to_pt(col_w.get(c, default_w), base_font)
-                usable = max(width * 0.95, 1.0)
-                lines = chars * fsz * CHAR_WIDTH_EM / usable
-                if token * fsz * CHAR_WIDTH_EM > usable:
-                    lines = max(lines, UNBREAKABLE)  # a word/URL wider than the column cannot wrap
+                si.text_cells.append((r, c, chars, fsz, token))
+                lines = wrapped_lines(chars, token, fsz, col_width_to_pt(col_w.get(c, default_w), base_font))
                 if lines > 1:
                     si.overflow.append((r, c, round(lines, 1)))
                     si.overflow_cells += 1

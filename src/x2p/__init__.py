@@ -1,2 +1,2 @@
 """Excel to PDF Professional — core package."""
-__version__ = "0.3.2"
+__version__ = "0.4.0"

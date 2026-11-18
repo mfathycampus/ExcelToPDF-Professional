@@ -5,7 +5,7 @@ import pymupdf
 import pytest
 
 from conftest import available_engines
-from x2p.models import FinalStatus, JobOptions
+from x2p.models import FinalStatus, JobOptions, LayoutMode
 from x2p.pipeline import Converter, sha256
 
 ENGINES = available_engines()
@@ -39,10 +39,30 @@ def test_reference_files_pass(engine, name, fixtures, tmp_path):
 def test_data_loss_is_detected_and_blocks_delivery(engine, name, code, fixtures, tmp_path):
     # automatic fixes off: the raw rendering must be caught by verification
     out = tmp_path / "x.pdf"
-    rep = Converter().convert(fixtures[name], out, JobOptions(engine=engine, wrap_overflow=False))
+    rep = Converter().convert(fixtures[name], out, JobOptions(engine=engine, wrap_overflow=False, widen_columns=False))
     assert rep.status is FinalStatus.FAILED
     assert code in {i.code for i in rep.issues}
     assert not rep.delivered and not out.exists()
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_hash_is_prevented_by_widening(engine, fixtures, tmp_path):
+    rep = Converter().convert(fixtures["90_narrow_hash"], tmp_path / "h.pdf", JobOptions(engine=engine))
+    assert rep.status is not FinalStatus.FAILED, [i.to_dict() for i in rep.issues]
+    codes = {i.code for i in rep.issues}
+    assert "columns_widened" in codes and "cell_overflow_hash" not in codes
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_manual_page_breaks_are_applied(engine, fixtures, tmp_path):
+    from x2p.inspector import inspect_workbook
+    si = inspect_workbook(fixtures["01_simple"]).sheets[0]
+    manual = {si.name: {"break_every": 5}}
+    rep = Converter().convert(fixtures["01_simple"], tmp_path / "b.pdf",
+                              JobOptions(engine=engine, mode=LayoutMode.MANUAL, manual=manual))
+    assert rep.status is not FinalStatus.FAILED, [i.to_dict() for i in rep.issues]
+    data_rows = len(si.row_heights_pt) - 1
+    assert rep.total_pages >= -(-data_rows // 5)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -50,7 +70,7 @@ def test_clipped_text_is_fixed_and_reported(engine, fixtures, tmp_path):
     rep = Converter().convert(fixtures["91_clipped_text"], tmp_path / "c.pdf", JobOptions(engine=engine))
     assert rep.status is not FinalStatus.FAILED, [i.to_dict() for i in rep.issues]
     codes = {i.code for i in rep.issues}
-    assert codes & {"overflow_text_wrapped", "long_text_to_appendix"}
+    assert codes & {"overflow_text_wrapped", "long_text_to_appendix", "columns_widened"}
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -120,3 +140,23 @@ def test_card_mode_is_complete(engine, fixtures, tmp_path):
     # 300 records x 40 fields + a title per record, every one found in the PDF
     assert v.expected_texts >= 300 * 40 and v.found_texts + len(v.rtl_unverified) == v.expected_texts
     assert rep.exported_sheets == ["Wide"] and v.min_font_pt >= 8
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_wide_sheet_without_key_gets_row_numbers_and_over_order(engine, tmp_path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append([f"Field {i}" for i in range(1, 31)])
+    for r in range(1, 61):
+        ws.append(["group " + "AB"[r % 2]] + [f"v{r}-{i} text" for i in range(2, 31)])  # no key column
+    src = tmp_path / "nokey.xlsx"
+    wb.save(src)
+    out = tmp_path / "nokey.pdf"
+    rep = Converter().convert(src, out, JobOptions(engine=engine))
+    assert rep.status is not FinalStatus.FAILED, [i.to_dict() for i in rep.issues]
+    assert "row_numbers_added" in {i.code for i in rep.issues}
+    with pymupdf.open(out) as doc:
+        first, second = doc[0].get_text(), doc[1].get_text()
+    # across, then down: page 2 holds other columns of the same first rows
+    assert "v1-2 text" in first and "v1-2 text" not in second and "v1-" in second

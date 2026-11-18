@@ -100,6 +100,9 @@ def apply_plan(doc, sheet, idx, plan):
     notes = []
     if plan.get("keep_original"):
         return notes
+    cols = sheet.getColumns()
+    for letter, pt in (plan.get("col_widths_pt") or {}).items():
+        cols.getByName(letter).Width = int(round(float(pt) * 2540 / 72))  # 1/100 mm
     for addr, marker in plan.get("endnotes") or []:
         sheet.getCellRangeByName(addr).setString(marker)
     for rng in plan.get("wrap_ranges") or []:
@@ -129,6 +132,14 @@ def apply_plan(doc, sheet, idx, plan):
         style.ScaleToPagesX = int(plan.get("fit_width") or 0)
         style.ScaleToPagesY = int(plan.get("fit_height") or 0)
     style.CenterHorizontally = bool(plan.get("center_horizontally"))
+    if plan.get("print_gridlines"):
+        style.PrintGrid = True
+    if plan.get("print_headings"):
+        style.PrintHeaders = True
+    style.PrintDownFirst = plan.get("page_order") != "over"
+    rows = sheet.getRows()
+    for r in plan.get("row_breaks") or []:
+        rows.getByIndex(int(r) - 1).IsStartOfNewPage = True
     if plan.get("title_rows"):
         a, b = (int(x) for x in plan["title_rows"].split(":"))
         sheet.setTitleRows(CellRangeAddress(idx, 0, a - 1, 0, b - 1))

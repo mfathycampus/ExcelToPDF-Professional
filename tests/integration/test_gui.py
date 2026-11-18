@@ -72,3 +72,28 @@ def test_update_button_finds_new_release(app, monkeypatch, tmp_path):
     assert offered[0].version == "99.0.0"
     assert "99.0.0" in w.act_update.text()
     w.close()
+
+
+def test_template_panel_suggests_and_overrides(app, fixtures):
+    from x2p.gui.main_window import MainWindow
+    w = MainWindow()
+    w.show()
+    w.open_file(str(fixtures["06_wide_long"]))
+    _wait(app, lambda: not w.runner.busy and w.info is not None)
+    tp = w.template
+    assert tp.isEnabled() and tp.sheet == w.info.sheets[0].name
+    suggested_cols = tp.cols.text()
+    assert tp.summary.text()                                   # parts / pages / fixed titles
+    tp.cols.setText("")                                        # user: no fixed column
+    tp.cols.editingFinished.emit()
+    assert tp.templates[tp.sheet]["title_cols"] == ""
+    opts = w._options()
+    assert opts.templates[tp.sheet]["title_cols"] == ""
+    tp.cols.setText("zz")                                      # invalid input is rejected
+    tp.cols.editingFinished.emit()
+    assert tp.error.text() and tp.templates[tp.sheet]["title_cols"] == ""
+    tp.reset.click()
+    assert tp.sheet not in tp.templates and tp.cols.text() == suggested_cols
+    tp.shape.setCurrentIndex(tp.modes.index(__import__("x2p.models", fromlist=["LayoutMode"]).LayoutMode.ONE_PAGE))
+    assert w._options().per_sheet_mode[tp.sheet].value == "one_page" and not tp.rows.isEnabled()
+    w.close()

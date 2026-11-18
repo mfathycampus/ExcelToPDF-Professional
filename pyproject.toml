@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "excel-to-pdf-professional"
-version = "0.3.2"
+version = "0.4.0"
 description = "Desktop app that converts Excel workbooks to verified, readable, printable PDF"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"

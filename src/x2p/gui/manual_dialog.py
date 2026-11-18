@@ -1,5 +1,6 @@
 """Per-sheet manual print settings (spec §5.4 "manual"): paper, orientation, scale or
-fit-to-width, margins, repeated title rows/columns. Starts from the automatic plan."""
+fit-to-width, margins, repeated title rows/columns, page breaks every N rows, gridlines and
+column widening. Starts from the automatic plan."""
 from __future__ import annotations
 
 import re
@@ -64,6 +65,18 @@ class ManualDialog(QDialog):
         form.addRow(tr("margins"), m_row)
         form.addRow(tr("title_rows"), self.rows)
         form.addRow(tr("title_cols"), self.cols)
+        self.break_every = QSpinBox(minimum=0, maximum=10000)
+        self.break_every.setSpecialValueText(tr("automatic"))
+        self.break_every.setValue(int(v.get("break_every") or 0))
+        self.break_every.setToolTip(tr("break_every_tip"))
+        form.addRow(tr("break_every"), self.break_every)
+        self.gridlines = QCheckBox(tr("print_gridlines"))
+        self.gridlines.setChecked(bool(v.get("print_gridlines", base.print_gridlines)))
+        form.addRow("", self.gridlines)
+        self.widen = QCheckBox(tr("widen_columns"))
+        self.widen.setChecked(v.get("widen_columns", True) is not False)
+        self.widen.setToolTip(tr("widen_columns_tip"))
+        form.addRow("", self.widen)
         lay.addLayout(form)
         self.error = QLabel()
         self.error.setStyleSheet("color: palette(link);")
@@ -94,4 +107,7 @@ class ManualDialog(QDialog):
             "margins_mm": tuple(sp.value() for sp in self.margins),
             "title_rows": self.rows.text().strip() or None,
             "title_cols": self.cols.text().strip().upper() or None,
+            "break_every": self.break_every.value() or None,
+            "print_gridlines": self.gridlines.isChecked(),
+            "widen_columns": self.widen.isChecked(),
         }

@@ -23,6 +23,7 @@ from ..models import ConversionReport, FinalStatus, JobOptions, LayoutMode, Seve
 from ..pipeline import deliver
 from ..layout import plan_sheet
 from .manual_dialog import ManualDialog
+from .template_panel import TemplatePanel
 from .update_ui import UpdateController
 from .worker import JobRunner
 
@@ -150,6 +151,10 @@ class MainWindow(QMainWindow):
         self.sheet_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.sheet_tree.itemChanged.connect(lambda *_: self._invalidate())
         sb.addWidget(self.sheet_tree)
+        self.template = TemplatePanel(self, SHEET_MODES)
+        self.template.changed.connect(self._invalidate)
+        self.template.shape_selected.connect(self._template_shape)
+        self.sheet_tree.currentItemChanged.connect(lambda cur, _prev: self._select_sheet(cur))
         self.settings_box = QGroupBox()
         form = QFormLayout(self.settings_box)
         self.engine_combo = QComboBox()
@@ -177,6 +182,7 @@ class MainWindow(QMainWindow):
         sv.addWidget(self.drop)
         sv.addWidget(self.file_label)
         sv.addWidget(self.sheets_box, 1)
+        sv.addWidget(self.template)
         sv.addWidget(self.settings_box)
 
         # preview
@@ -272,6 +278,7 @@ class MainWindow(QMainWindow):
         self.settings_box.setTitle(t("settings"))
         self.report_box.setTitle(t("report"))
         self.sheet_tree.setHeaderLabels([t("sheets"), "", t("mode"), t("est_pages")])
+        self.template.retranslate(t)
         self.lbl_long.setText(t("long_text"))
         cur_long = max(0, self.long_combo.currentIndex())
         self.long_combo.blockSignals(True)
@@ -347,12 +354,20 @@ class MainWindow(QMainWindow):
         if self.report is not None and self._options_key() != self.report_opts_key:
             self.page_view.setEnabled(False)
         self._update_estimates()
+        self.template.refresh()
 
     def _update_estimates(self):
         """Planner estimate per sheet (before any conversion): pages and horizontal parts."""
         if not self.info or self.sheet_tree.topLevelItemCount() != len(self.info.sheets):
             return
         opts = self._options()
+        self.sheet_tree.blockSignals(True)      # writing estimates must not count as an edit
+        try:
+            self._write_estimates(opts)
+        finally:
+            self.sheet_tree.blockSignals(False)
+
+    def _write_estimates(self, opts):
         for i, s in enumerate(self.info.sheets):
             it = self.sheet_tree.topLevelItem(i)
             if s.is_empty or it.checkState(0) != Qt.Checked:
@@ -386,6 +401,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_dir", str(Path(path).parent))
         self.path, self.info, self.last_output = path, None, None
         self.manual = {}
+        self.template.clear()
         self._clear_preview()
         p = Path(path)
         try:
@@ -429,7 +445,27 @@ class MainWindow(QMainWindow):
             self.sheet_tree.setItemWidget(it, 2, combo)
         self.sheet_tree.blockSignals(False)
         self.sheet_tree.resizeColumnToContents(1)
+        first = next((i for i, s in enumerate(self.info.sheets) if not s.is_empty), None)
+        if first is not None:
+            self.sheet_tree.setCurrentItem(self.sheet_tree.topLevelItem(first))
         self._update_estimates()
+
+    def _select_sheet(self, item):
+        if item is None or not self.info:
+            self.template.show_sheet(None)
+            return
+        combo = self.sheet_tree.itemWidget(item, 2)
+        self.template.show_sheet(item.text(0), combo.currentIndex() if combo else 0)
+
+    def _template_shape(self, name: str, idx: int):
+        """The template's shape list drives the sheet's mode combo (one source of truth)."""
+        for i in range(self.sheet_tree.topLevelItemCount()):
+            it = self.sheet_tree.topLevelItem(i)
+            if it.text(0) == name:
+                combo = self.sheet_tree.itemWidget(it, 2)
+                if combo is not None and combo.currentIndex() != idx:
+                    combo.setCurrentIndex(idx)
+                return
 
     def _sheet_mode_changed(self, name: str, combo: QComboBox, idx: int):
         if SHEET_MODES[idx] == LayoutMode.MANUAL:
@@ -446,6 +482,8 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(False)
         else:
             self.manual.pop(name, None)
+        if self.template.sheet == name:
+            self.template.show_sheet(name, combo.currentIndex())
         self._invalidate()
 
     def _on_hidden_toggled(self, on):
@@ -473,12 +511,14 @@ class MainWindow(QMainWindow):
                           manual=manual, paper=self.paper_combo.currentText(),
                           allow_larger_paper=self.a3_chk.isChecked(), min_font_pt=self.min_font.value(),
                           engine=self.engine_combo.currentData() or "auto",
-                          long_text=self.long_combo.currentData() or "appendix", lang=self.tr_.lang)
+                          long_text=self.long_combo.currentData() or "appendix", lang=self.tr_.lang,
+                          templates={n: dict(v) for n, v in self.template.templates.items() if n in selected})
 
     def _options_key(self) -> str:
         o = self._options()
         return repr((o.sheets, sorted((k, v.value) for k, v in o.per_sheet_mode.items()), o.paper,
-                     o.allow_larger_paper, o.min_font_pt, o.engine, o.long_text, sorted(o.manual.items())))
+                     o.allow_larger_paper, o.min_font_pt, o.engine, o.long_text, sorted(o.manual.items()),
+                     sorted((k, sorted(v.items())) for k, v in o.templates.items())))
 
     def preview(self):
         if not self.path or self.runner.busy:

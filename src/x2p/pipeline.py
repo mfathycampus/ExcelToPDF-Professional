@@ -162,7 +162,10 @@ class Converter:
             "sheets": [{"name": o.info.name, "plan": o.plan.to_dict(),
                         **({"create_appendix": o.create} if o.create else {})} for o in outcomes],
         }
-        result = engine.run(job, out_dir, timeout_s=opts.timeout_s, cancel=cancel)
+        # big sheets take longer (wrapping, row heights, text collection): scale the time limit
+        cells = sum(o.info.value_cells + o.info.formula_cells for o in outcomes)
+        timeout = int(opts.timeout_s + cells / 50)
+        result = engine.run(job, out_dir, timeout_s=timeout, cancel=cancel)
         report.engine_version = result.get("engine_version", "")
         by_name = {r["name"]: r for r in result.get("sheets", [])}
         for o in outcomes:
@@ -192,6 +195,10 @@ class Converter:
                              {"count": len(v.rtl_unverified), "cells": v.rtl_unverified[:20]}))
         if v.hash_cells:
             iss.append(Issue("cell_overflow_hash", Severity.ERROR, name, {"count": v.hash_cells}))
+        if r.get("paper_mismatch"):
+            w, h = r["paper_mismatch"]
+            iss.append(Issue("paper_changed_by_printer", Severity.WARNING, name,
+                             {"paper": o.plan.paper, "size": f"{round(w / 72 * 25.4)}x{round(h / 72 * 25.4)} mm"}))
         threshold = min(opts.min_font_pt, o.info.min_font_pt_source or opts.min_font_pt)
         below, total = chars_below(sizes, threshold)
         if below:
@@ -228,7 +235,9 @@ class Converter:
             if note == "cards_suggested":
                 detail = {"parts": o.plan.expected_pages_across}
             elif note == "overflow_text_wrapped":
-                detail = {"count": o.info.overflow_cells - len(o.plan.long_cells)}
+                detail = {"count": o.plan.wrapped_cells}
+            elif note == "columns_widened":
+                detail = {"count": len(o.plan.col_widths)}
             elif note == "long_text_to_appendix":
                 detail = {"count": len(o.plan.long_cells)}
             iss.append(Issue(note, sev, name, detail))

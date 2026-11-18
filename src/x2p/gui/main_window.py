@@ -323,7 +323,14 @@ class MainWindow(QMainWindow):
         self.act_preview.setEnabled(not busy and self.info is not None and has_engine)
         self.act_export.setEnabled(not busy and self.info is not None and has_engine)
         self.act_cancel.setEnabled(busy)
-        self.progress.setVisible(busy and key not in ("done", "failed", "cancelled", "inspected"))
+        self.progress.setVisible(busy)
+        if busy:  # inspection has no measurable steps: show a moving bar instead of 0%
+            self.progress.setRange(0, 0 if key == "inspecting" else 100)
+            if key != "inspecting":
+                self.progress.setValue(0)
+            self.setCursor(Qt.BusyCursor)
+        else:
+            self.unsetCursor()
         done = bool(self.last_output)
         self.btn_open_pdf.setEnabled(done)
         self.btn_open_dir.setEnabled(done)

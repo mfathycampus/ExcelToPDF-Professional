@@ -41,11 +41,12 @@ class JobRunner(QObject):
         super().__init__(parent)
         self._thread: QThread | None = None
         self._job: _Job | None = None
+        self._kind, self._outcome = "", []
         self.cancel_event = threading.Event()
 
     @property
     def busy(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
+        return self._thread is not None
 
     def _start(self, kind: str, fn):
         if self.busy:
@@ -56,11 +57,28 @@ class JobRunner(QObject):
         self._job.moveToThread(self._thread)
         self._thread.started.connect(self._job.run)
         self._job.progress.connect(self.progress)
-        self._job.finished.connect(lambda r: self.finished.emit(kind, r))
-        self._job.failed.connect(lambda c, d: self.failed.emit(kind, c, d))
+        # Report the outcome only after the thread has fully stopped: the UI decides which
+        # buttons to enable from `busy`, which must already be False when it hears the result.
+        outcome: list = []
+        self._job.finished.connect(lambda r: outcome.append(("ok", r)))
+        self._job.failed.connect(lambda c, d: outcome.append(("err", (c, d))))
         self._job.finished.connect(self._thread.quit)
         self._job.failed.connect(self._thread.quit)
+        self._kind, self._outcome = kind, outcome
+        # bound slot of this QObject (main thread): queued, so it runs on the UI thread
+        self._thread.finished.connect(self._deliver)
         self._thread.start()
+
+    def _deliver(self):
+        kind, outcome = self._kind, self._outcome
+        self._thread = None
+        self._job = None
+        if not outcome:
+            self.failed.emit(kind, "engine_failed", {})
+        elif outcome[0][0] == "ok":
+            self.finished.emit(kind, outcome[0][1])
+        else:
+            self.failed.emit(kind, *outcome[0][1])
 
     def inspect(self, path: str):
         self._start("inspect", lambda job: inspect_workbook(path))

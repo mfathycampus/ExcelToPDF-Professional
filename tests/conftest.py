@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
+os.environ["X2P_NO_UPDATE_CHECK"] = "1"   # tests never call GitHub on their own
 
 
 @pytest.fixture(scope="session")

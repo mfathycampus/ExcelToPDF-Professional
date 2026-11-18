@@ -1,4 +1,4 @@
-"""Command line interface: x2p inspect | convert | engines"""
+"""Command line interface: x2p inspect | convert | engines | update"""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,32 @@ def _print_json(obj) -> None:
     sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2, default=str) + "\n")
 
 
+def _update(check_only: bool, tr) -> int:
+    """0: up to date or update started, 1: update available (--check), 2: error."""
+    from . import __version__, updater
+    try:
+        info = updater.check_latest()
+        if info is None:
+            _print_json({"current": __version__, "update": None})
+            return 0
+        _print_json({"current": __version__, "update": info.version, "page": info.page_url})
+        if check_only:
+            return 1
+        dest = updater.install_dir()
+        if dest is None or not updater.can_self_update():
+            sys.stderr.write(tr("update_open_page") + ": " + info.page_url + "\n")
+            return 2
+        z = updater.download(info, updater.staging_dir().parent)
+        app = updater.stage(z, updater.staging_dir())
+        z.unlink(missing_ok=True)
+        log = updater.launch_replacer(app, dest)
+        _print_json({"installing": info.version, "log": str(log)})
+        return 0
+    except updater.UpdateError as e:
+        sys.stderr.write(tr(e.code) + "\n")
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -26,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("engines", help="show available conversion engines")
+
+    p_up = sub.add_parser("update", help="check for a newer release (and install it in the packaged app)")
+    p_up.add_argument("--check", action="store_true", help="only report whether an update exists")
 
     p_in = sub.add_parser("inspect", help="inspect a workbook (read-only)")
     p_in.add_argument("file")
@@ -54,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "engines":
         _print_json(engine_status())
         return 0
+
+    if a.cmd == "update":
+        return _update(a.check, tr)
 
     if a.cmd == "inspect":
         try:

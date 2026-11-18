@@ -23,6 +23,7 @@ from ..models import ConversionReport, FinalStatus, JobOptions, LayoutMode, Seve
 from ..pipeline import deliver
 from ..layout import plan_sheet
 from .manual_dialog import ManualDialog
+from .update_ui import UpdateController
 from .worker import JobRunner
 
 MODES = [LayoutMode.AUTO, LayoutMode.FIT_WIDTH, LayoutMode.ONE_PAGE, LayoutMode.KEEP_ORIGINAL,
@@ -75,12 +76,14 @@ class MainWindow(QMainWindow):
         self._kept_dirs: list[Path] = []
         self.manual: dict[str, dict] = {}
         self._qt_translator = QTranslator(self)   # Qt's own strings (OK, Cancel, file dialogs)
+        self.updates = UpdateController(self)
         self._build()
         self._retranslate()
         self._set_state("idle")
         self.resize(1280, 820)
         if self.engine_combo.count() == 0:
             QTimer.singleShot(400, self.engine_help)
+        self.updates.schedule_startup_check()
 
     # ------------------------------------------------------------------ engines
     LO_URL = "https://www.libreoffice.org/download/download-libreoffice/"
@@ -121,12 +124,14 @@ class MainWindow(QMainWindow):
         self.act_cancel = QAction(self, shortcut="Esc", triggered=self.runner.cancel)
         self.act_lang = QAction(self, triggered=self.toggle_language)
         self.act_engines = QAction(self, triggered=self.engine_help)
+        self.act_update = QAction(self, triggered=lambda: self.updates.check(manual=True))
         for a in (self.act_open, self.act_preview, self.act_export, self.act_cancel):
             tb.addAction(a)
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
         tb.addWidget(spacer)
+        tb.addAction(self.act_update)
         tb.addAction(self.act_engines)
         tb.addAction(self.act_lang)
 
@@ -260,6 +265,8 @@ class MainWindow(QMainWindow):
         self.act_cancel.setText(t("cancel"))
         self.act_lang.setText(t("language"))
         self.act_engines.setText(t("engines"))
+        self.act_update.setText(t("update_available_short", version=self.updates.info.version)
+                                if self.updates.info else t("check_updates"))
         self.drop.setText(t("drop_hint"))
         self.sheets_box.setTitle(t("sheets"))
         self.settings_box.setTitle(t("settings"))
